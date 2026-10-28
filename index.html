@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Adaptive Street Light – Virtual Model</title>
+<style>
+  :root{--bg:#0f1420;--card:#171e2e;--line:#2a3550;--text:#e6ebf5;--mute:#8d99b3;--accent:#ffc83d;--good:#3ddc97}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--text)}
+  .wrap{max-width:1000px;margin:0 auto;padding:16px}
+  h1{font-size:1.25rem;margin:0 0 4px}
+  p.sub{margin:0 0 12px;color:var(--mute);font-size:.9rem}
+  canvas{width:100%;height:auto;border-radius:10px;border:1px solid var(--line);display:block}
+  .panel{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-top:12px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px}
+  .card h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.06em;color:var(--mute);margin:0 0 10px}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
+  button{background:#232d45;color:var(--text);border:1px solid var(--line);padding:8px 12px;border-radius:8px;cursor:pointer;font-size:.9rem}
+  button:hover{background:#2c3856}
+  label{font-size:.85rem;color:var(--mute);display:flex;gap:6px;align-items:center}
+  input[type=range]{width:100%}
+  .stat{display:flex;justify-content:space-between;font-size:.92rem;padding:3px 0}
+  .stat b{font-variant-numeric:tabular-nums}
+  .save{color:var(--good);font-size:1.4rem;font-weight:700}
+  ol{margin:0;padding-left:18px;color:var(--mute);font-size:.85rem;line-height:1.5}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Adaptive Street Light – Virtual Model</h1>
+  <p class="sub">LDR + motion sensing + dimming controller, simulated. Compare with a conventional always-on system.</p>
+
+  <canvas id="c" width="960" height="420"></canvas>
+
+  <div class="panel">
+    <div class="card">
+      <h2>Controls</h2>
+      <div class="row">
+        <button id="car">+ Car</button>
+        <button id="ped">+ Pedestrian</button>
+        <button id="pause">Pause clock</button>
+      </div>
+      <div class="row">
+        <label><input type="checkbox" id="auto" checked> Auto traffic</label>
+        <label><input type="checkbox" id="range"> Show sensor range</label>
+      </div>
+      <label style="display:block">Time of day: <b id="hlabel">20:00</b>
+        <input type="range" id="hour" min="0" max="23.99" step="0.05" value="20"></label>
+      <label style="display:block;margin-top:8px">Clock speed (sim min / sec): <b id="slabel">30</b>
+        <input type="range" id="speed" min="1" max="120" step="1" value="30"></label>
+      <label style="display:block;margin-top:8px">Idle dim level at night: <b id="dlabel">20%</b>
+        <input type="range" id="dim" min="0" max="50" step="5" value="20"></label>
+    </div>
+
+    <div class="card">
+      <h2>Live readings</h2>
+      <div class="stat"><span>Sim time</span><b id="t">–</b></div>
+      <div class="stat"><span>Ambient light (LDR)</span><b id="lux">–</b></div>
+      <div class="stat"><span>Mode</span><b id="mode">–</b></div>
+      <div class="stat"><span>Lamps at full / dimmed / off</span><b id="cnt">–</b></div>
+      <div class="stat"><span>Adaptive power now</span><b id="pa">–</b></div>
+      <div class="stat"><span>Conventional power now</span><b id="pc">–</b></div>
+    </div>
+
+    <div class="card">
+      <h2>Energy used (since page load)</h2>
+      <div class="stat"><span>Adaptive</span><b id="ea">0 Wh</b></div>
+      <div class="stat"><span>Conventional</span><b id="ec">0 Wh</b></div>
+      <div class="stat"><span>Energy saved</span><span class="save" id="sv">0%</span></div>
+    </div>
+
+    <div class="card">
+      <h2>Control logic</h2>
+      <ol>
+        <li>LDR reads ambient light. Daylight: all lamps OFF.</li>
+        <li>Night, nothing nearby: lamp holds at dim level.</li>
+        <li>Motion sensor detects a vehicle or person within range: lamp goes to 100%.</li>
+        <li>After the object leaves, the lamp holds for a short delay, then fades back to dim.</li>
+      </ol>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  // ---------- config ----------
+  const W = 960, H = 420;
+  const N_LAMPS = 8, SPACING = 112, FIRST_X = 70;
+  const LAMP_WATT = 60;            // full-power LED lamp
+  const SENSOR_RANGE = 120;        // px, motion detection radius
+  const HOLD_FRAMES = 90;          // keep lamp bright after last detection
+  const NIGHT_LIGHT_LEVEL = 0.2;   // daylight below this = night (LDR threshold)
+  const ROAD_TOP = 250, ROAD_BOT = 340;
+
+  const cv = document.getElementById('c');
+  const ctx = cv.getContext('2d');
+  const $ = id => document.getElementById(id);
+
+  // ---------- state ----------
+  let simHour = 20;
+  let paused = false;
+  let eA = 0, eC = 0;              // Wh
+  let entities = [];
+  let spawnTimer = 0;
+  const lamps = [];
+  for (let i = 0; i < N_LAMPS; i++) lamps.push({ x: FIRST_X + i * SPACING, b: 0, hold: 0, active: false });
+
+  // ---------- helpers ----------
+  const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const mix = (c1, c2, t) => c1.map((v, i) => Math.round(lerp(v, c2[i], t)));
+
+  // 0 (dark) .. 1 (bright noon), sunrise 6h, sunset 18h with soft twilight
+  function daylight(h) {
+    return clamp(Math.sin(Math.PI * (h - 6) / 12) * 1.6, 0, 1);
+  }
+  function fmt(h) {
+    const hh = Math.floor(h), mm = Math.floor((h - hh) * 60);
+    return String(hh).padStart(2, '0') + ':' + String(mm).padStart(2, '0');
+  }
+
+  function spawn(type) {
+    if (type === 'car') {
+      const dir = Math.random() < 0.5 ? 1 : -1;
+      entities.push({ type, dir, x: dir === 1 ? -40 : W + 40, y: dir === 1 ? 282 : 316,
+        v: (2.2 + Math.random() * 1.6) * dir, col: ['#e14b4b', '#4b8be1', '#e1c84b', '#9b6be1', '#dcdcdc'][Math.floor(Math.random() * 5)] });
+    } else {
+      const dir = Math.random() < 0.5 ? 1 : -1;
+      const top = Math.random() < 0.5;
+      entities.push({ type, dir, x: dir === 1 ? -10 : W + 10, y: top ? 238 : 358, v: (0.6 + Math.random() * 0.4) * dir, phase: Math.random() * 6 });
+    }
+  }
+
+  // ---------- update ----------
+  function update(dtSec) {
+    // clock
+    const minPerSec = +$('speed').value;
+    if (!paused) {
+      simHour = (simHour + dtSec * minPerSec / 60) % 24;
+      $('hour').value = simHour;
+    }
+
+    // traffic
+    if ($('auto').checked) {
+      spawnTimer -= dtSec;
+      if (spawnTimer <= 0) {
+        // fewer vehicles in the small hours, more in the evening
+        const busy = (simHour > 22 || simHour < 5) ? 0.25 : 1;
+        if (Math.random() < busy) spawn(Math.random() < 0.7 ? 'car' : 'ped');
+        spawnTimer = 1.2 + Math.random() * 2.2;
+      }
+    }
+    entities.forEach(e => e.x += e.v);
+    entities = entities.filter(e => e.x > -60 && e.x < W + 60);
+
+    // controller
+    const day = daylight(simHour);
+    const isNight = day < NIGHT_LIGHT_LEVEL;
+    const dim = +$('dim').value / 100;
+
+    lamps.forEach(l => {
+      l.active = entities.some(e => Math.abs(e.x - l.x) < SENSOR_RANGE);
+      if (l.active) l.hold = HOLD_FRAMES; else if (l.hold > 0) l.hold--;
+      let target = 0;
+      if (isNight) target = l.hold > 0 ? 1 : dim;
+      l.b += (target - l.b) * 0.12;
+      if (Math.abs(l.b - target) < 0.003) l.b = target;
+    });
+
+    // energy (sim hours elapsed this frame)
+    const dHours = paused ? 0 : dtSec * minPerSec / 60;
+    const pA = lamps.reduce((s, l) => s + l.b * LAMP_WATT, 0);
+    const pC = isNight ? N_LAMPS * LAMP_WATT : 0;
+    eA += pA * dHours;
+    eC += pC * dHours;
+
+    // readouts
+    $('hlabel').textContent = fmt(simHour);
+    $('slabel').textContent = minPerSec;
+    $('dlabel').textContent = Math.round(dim * 100) + '%';
+    $('t').textContent = fmt(simHour);
+    $('lux').textContent = Math.round(day * 100) + '% (' + (isNight ? 'dark' : 'bright') + ')';
+    $('mode').textContent = !isNight ? 'Day – lamps OFF' : 'Night – adaptive';
+    const full = lamps.filter(l => l.b > 0.9).length;
+    const off = lamps.filter(l => l.b < 0.02).length;
+    $('cnt').textContent = full + ' / ' + (N_LAMPS - full - off) + ' / ' + off;
+    $('pa').textContent = Math.round(pA) + ' W';
+    $('pc').textContent = Math.round(pC) + ' W';
+    $('ea').textContent = eA.toFixed(0) + ' Wh';
+    $('ec').textContent = eC.toFixed(0) + ' Wh';
+    $('sv').textContent = eC > 0 ? Math.max(0, (1 - eA / eC) * 100).toFixed(0) + '%' : '0%';
+  }
+
+  // ---------- draw ----------
+  function draw() {
+    const day = daylight(simHour);
+    const top = mix([6, 8, 22], [110, 175, 235], day);
+    const bot = mix([14, 18, 38], [190, 220, 245], day);
+    const g = ctx.createLinearGradient(0, 0, 0, 230);
+    g.addColorStop(0, `rgb(${top})`); g.addColorStop(1, `rgb(${bot})`);
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, 240);
+
+    // stars
+    if (day < 0.5) {
+      ctx.fillStyle = `rgba(255,255,255,${(0.5 - day) * 1.6})`;
+      for (let i = 0; i < 40; i++) ctx.fillRect((i * 97) % W, (i * 53) % 150, 1.5, 1.5);
+    }
+    // sun / moon
+    const sunA = Math.PI * (simHour - 6) / 12;
+    const sx = W / 2 - Math.cos(sunA) * 420, sy = 200 - Math.sin(sunA) * 170;
+    if (simHour >= 5.5 && simHour <= 18.5) {
+      ctx.fillStyle = '#ffd95a'; ctx.beginPath(); ctx.arc(sx, sy, 18, 0, 7); ctx.fill();
+    } else {
+      const mh = (simHour + 6) % 24, ma = Math.PI * (mh - 6) / 12;
+      ctx.fillStyle = '#e8ecf5'; ctx.beginPath();
+      ctx.arc(W / 2 - Math.cos(ma) * 420, 200 - Math.sin(ma) * 170, 13, 0, 7); ctx.fill();
+    }
+
+    // ground, sidewalks, road
+    ctx.fillStyle = `rgb(${mix([14, 20, 18], [96, 130, 90], day)})`; ctx.fillRect(0, 240, W, H - 240);
+    ctx.fillStyle = `rgb(${mix([40, 42, 50], [150, 150, 155], day)})`;
+    ctx.fillRect(0, 226, W, 24); ctx.fillRect(0, 340, W, 34);
+    ctx.fillStyle = `rgb(${mix([22, 24, 30], [70, 72, 78], day)})`; ctx.fillRect(0, ROAD_TOP, W, ROAD_BOT - ROAD_TOP);
+    ctx.strokeStyle = `rgba(255,255,255,${0.25 + day * 0.4})`; ctx.setLineDash([22, 18]); ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(0, 295); ctx.lineTo(W, 295); ctx.stroke(); ctx.setLineDash([]);
+
+    // light pools on road
+    const night = 1 - day;
+    lamps.forEach(l => {
+      if (l.b < 0.01) return;
+      ctx.save();
+      ctx.translate(l.x, 296); ctx.scale(1, 0.55);
+      const rg = ctx.createRadialGradient(0, 0, 4, 0, 0, 125);
+      const a = l.b * (0.35 + night * 0.4);
+      rg.addColorStop(0, `rgba(255,214,120,${a})`);
+      rg.addColorStop(1, 'rgba(255,214,120,0)');
+      ctx.fillStyle = rg; ctx.beginPath(); ctx.arc(0, 0, 125, 0, 7); ctx.fill();
+      ctx.restore();
+    });
+
+    // sensor range
+    if ($('range').checked) {
+      ctx.setLineDash([4, 5]); ctx.lineWidth = 1;
+      lamps.forEach(l => {
+        ctx.strokeStyle = l.active ? 'rgba(61,220,151,.8)' : 'rgba(150,160,190,.35)';
+        ctx.beginPath(); ctx.moveTo(l.x - SENSOR_RANGE, 226); ctx.lineTo(l.x - SENSOR_RANGE, 374);
+        ctx.moveTo(l.x + SENSOR_RANGE, 226); ctx.lineTo(l.x + SENSOR_RANGE, 374); ctx.stroke();
+      });
+      ctx.setLineDash([]);
+    }
+
+    // poles + lamp heads
+    lamps.forEach(l => {
+      ctx.strokeStyle = '#555d70'; ctx.lineWidth = 5;
+      ctx.beginPath(); ctx.moveTo(l.x - 16, 240); ctx.lineTo(l.x - 16, 165); ctx.lineTo(l.x, 165); ctx.stroke();
+      // glow
+      if (l.b > 0.01) {
+        const gl = ctx.createRadialGradient(l.x, 170, 2, l.x, 170, 42);
+        gl.addColorStop(0, `rgba(255,225,140,${l.b})`); gl.addColorStop(1, 'rgba(255,225,140,0)');
+        ctx.fillStyle = gl; ctx.beginPath(); ctx.arc(l.x, 170, 42, 0, 7); ctx.fill();
+      }
+      ctx.fillStyle = l.b > 0.01 ? `rgb(255,${Math.round(200 + 40 * l.b)},${Math.round(110 + 80 * l.b)})` : '#2a2f3c';
+      ctx.fillRect(l.x - 9, 165, 18, 7);
+      // sensor LED: green = motion detected
+      ctx.fillStyle = l.active ? '#3ddc97' : '#3a4256';
+      ctx.beginPath(); ctx.arc(l.x - 16, 160, 3, 0, 7); ctx.fill();
+      // brightness label
+      ctx.fillStyle = 'rgba(230,235,245,.85)'; ctx.font = '11px system-ui'; ctx.textAlign = 'center';
+      ctx.fillText(Math.round(l.b * 100) + '%', l.x - 16, 150);
+    });
+
+    // entities
+    entities.forEach(e => {
+      if (e.type === 'car') {
+        ctx.fillStyle = e.col; ctx.fillRect(e.x - 20, e.y - 9, 40, 14);
+        ctx.fillStyle = 'rgba(20,25,40,.8)'; ctx.fillRect(e.x - 9, e.y - 14, 18, 7);
+        ctx.fillStyle = '#111'; ctx.beginPath(); ctx.arc(e.x - 11, e.y + 5, 4, 0, 7); ctx.arc(e.x + 11, e.y + 5, 4, 0, 7); ctx.fill();
+        if (night > 0.5) {
+          const hx = e.x + e.dir * 20;
+          const hg = ctx.createLinearGradient(hx, 0, hx + e.dir * 60, 0);
+          hg.addColorStop(0, 'rgba(255,245,200,.45)'); hg.addColorStop(1, 'rgba(255,245,200,0)');
+          ctx.fillStyle = hg; ctx.beginPath();
+          ctx.moveTo(hx, e.y - 3); ctx.lineTo(hx + e.dir * 60, e.y - 14); ctx.lineTo(hx + e.dir * 60, e.y + 8); ctx.closePath(); ctx.fill();
+        }
+      } else {
+        const sw = Math.sin(e.x * 0.25 + e.phase) * 4;
+        ctx.strokeStyle = '#f1f1f1'; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(e.x, e.y - 14, 4, 0, 7); ctx.moveTo(e.x, e.y - 10); ctx.lineTo(e.x, e.y + 2);
+        ctx.moveTo(e.x, e.y + 2); ctx.lineTo(e.x - sw, e.y + 12); ctx.moveTo(e.x, e.y + 2); ctx.lineTo(e.x + sw, e.y + 12); ctx.stroke();
+      }
+    });
+
+    // label
+    ctx.fillStyle = 'rgba(255,255,255,.85)'; ctx.font = '12px system-ui'; ctx.textAlign = 'left';
+    ctx.fillText('Green dot on pole = motion sensor triggered', 10, H - 8);
+  }
+
+  // ---------- loop ----------
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000); last = now;
+    update(dt); draw();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  // ---------- events ----------
+  $('car').onclick = () => spawn('car');
+  $('ped').onclick = () => spawn('ped');
+  $('pause').onclick = () => { paused = !paused; $('pause').textContent = paused ? 'Resume clock' : 'Pause clock'; };
+  $('hour').oninput = e => { simHour = +e.target.value; };
+})();
+</script>
+</body>
+</html>
